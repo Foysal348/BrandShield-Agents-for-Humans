@@ -1,0 +1,7 @@
+boto3==1.43.92
+pandas==3.0.5
+pydantic==2.13.5
+python-dotenv==1.2.3
+strands-agents==1.55.1
+streamlit==1.63.0
+pytest==9.1.1

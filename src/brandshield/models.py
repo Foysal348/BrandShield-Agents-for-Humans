@@ -16,6 +16,14 @@ class RiskLevel(StrEnum):
     CRITICAL = "critical"
 
 
+class CaseStatus(StrEnum):
+    NEW = "new"
+    UNDER_REVIEW = "under_review"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    CLOSED = "closed"
+
+
 class CatalogProduct(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -80,3 +88,29 @@ class RiskAssessment(BaseModel):
         "This assessment prioritizes listings for review; it does not determine that an item "
         "is counterfeit. A human must approve any enforcement action."
     )
+
+
+class InvestigationCase(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    case_id: str
+    listing: ListingInput
+    product: CatalogProduct
+    assessment: RiskAssessment
+    status: CaseStatus = CaseStatus.NEW
+    reviewer_name: str | None = None
+    reviewer_note: str | None = None
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    version: int = Field(default=1, ge=1)
+
+
+class AuditEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    event_id: int
+    case_id: str
+    event_type: str
+    actor: str
+    details: dict[str, str | int | float | bool | None] = Field(default_factory=dict)
+    occurred_at: datetime

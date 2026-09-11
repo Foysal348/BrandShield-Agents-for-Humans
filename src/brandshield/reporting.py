@@ -25,6 +25,9 @@ def draft_takedown_report(case: InvestigationCase) -> str:
     listing_url = str(case.listing.listing_url) if case.listing.listing_url else "Not provided"
     price_ratio = float(case.listing.price / case.product.msrp)
     generated_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    evidence_hash = case.evidence.sha256 if case.evidence else "Not captured"
+    evidence_path = case.evidence.relative_path if case.evidence else "Not captured"
+    reappearance = case.reappeared_from_case_id or "No prior linked case"
 
     return f"""# DRAFT - Marketplace Listing Review Request
 
@@ -67,6 +70,9 @@ Our internal triage identified observable inconsistencies that require platform 
 - Reviewer: {case.reviewer_name or "Not recorded"}
 - Reviewer note: {case.reviewer_note or "Not recorded"}
 - Assessment evaluated at: {case.assessment.evaluated_at.isoformat(timespec="seconds")}
+- Evidence SHA-256: `{evidence_hash}`
+- Evidence snapshot: `{evidence_path}`
+- Reappearance link: {reappearance}
 
 ## Required before sending
 

@@ -8,10 +8,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
+from brandshield.evidence import listing_identity_fingerprint
 from brandshield.models import (
     AuditEvent,
     CaseStatus,
     InvestigationCase,
+    MonitoringRun,
 )
 
 
@@ -51,6 +53,8 @@ class SQLiteCaseRepository:
                     listing_json TEXT NOT NULL,
                     product_json TEXT NOT NULL,
                     assessment_json TEXT NOT NULL,
+                    evidence_json TEXT,
+                    reappeared_from_case_id TEXT,
                     reviewer_name TEXT,
                     reviewer_note TEXT,
                     created_at TEXT NOT NULL,
@@ -68,10 +72,18 @@ class SQLiteCaseRepository:
                     FOREIGN KEY (case_id) REFERENCES investigation_cases(case_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS monitoring_runs (
+                    run_id TEXT PRIMARY KEY,
+                    run_json TEXT NOT NULL,
+                    completed_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_cases_status
                     ON investigation_cases(status);
                 CREATE INDEX IF NOT EXISTS idx_audit_case_id
                     ON audit_events(case_id, event_id);
+                CREATE INDEX IF NOT EXISTS idx_monitoring_completed
+                    ON monitoring_runs(completed_at DESC);
 
                 CREATE TRIGGER IF NOT EXISTS audit_events_no_update
                 BEFORE UPDATE ON audit_events
@@ -86,6 +98,18 @@ class SQLiteCaseRepository:
                 END;
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(investigation_cases)")
+            }
+            if "evidence_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE investigation_cases ADD COLUMN evidence_json TEXT"
+                )
+            if "reappeared_from_case_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE investigation_cases ADD COLUMN reappeared_from_case_id TEXT"
+                )
 
     def create_case(
         self,
@@ -98,8 +122,9 @@ class SQLiteCaseRepository:
                 """
                 INSERT INTO investigation_cases (
                     case_id, status, listing_json, product_json, assessment_json,
+                    evidence_json, reappeared_from_case_id,
                     reviewer_name, reviewer_note, created_at, updated_at, version
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     case.case_id,
@@ -107,6 +132,8 @@ class SQLiteCaseRepository:
                     case.listing.model_dump_json(),
                     case.product.model_dump_json(),
                     case.assessment.model_dump_json(),
+                    case.evidence.model_dump_json() if case.evidence else None,
+                    case.reappeared_from_case_id,
                     case.reviewer_name,
                     case.reviewer_note,
                     case.created_at.isoformat(),
@@ -123,6 +150,9 @@ class SQLiteCaseRepository:
                     "status": case.status.value,
                     "risk_score": case.assessment.score,
                     "risk_level": case.assessment.level.value,
+                    "evidence_sha256": case.evidence.sha256 if case.evidence else None,
+                    "evidence_path": case.evidence.relative_path if case.evidence else None,
+                    "reappeared_from_case_id": case.reappeared_from_case_id,
                 },
             )
         return case
@@ -150,6 +180,32 @@ class SQLiteCaseRepository:
         with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [self._case_from_row(row) for row in rows]
+
+    def find_case_by_listing_id(self, listing_id: str) -> InvestigationCase | None:
+        """Find an existing case for the exact marketplace listing ID."""
+        return next(
+            (case for case in self.list_cases() if case.listing.listing_id == listing_id),
+            None,
+        )
+
+    def find_case_by_identity_fingerprint(
+        self,
+        identity_fingerprint: str,
+        *,
+        exclude_listing_id: str | None = None,
+    ) -> InvestigationCase | None:
+        """Find the newest prior case matching the seller/product listing identity."""
+        for case in self.list_cases():
+            if case.listing.listing_id == exclude_listing_id:
+                continue
+            stored_fingerprint = (
+                case.evidence.identity_fingerprint
+                if case.evidence is not None
+                else listing_identity_fingerprint(case.listing, case.product)
+            )
+            if stored_fingerprint == identity_fingerprint:
+                return case
+        return None
 
     def transition(
         self,
@@ -245,6 +301,41 @@ class SQLiteCaseRepository:
             for row in rows
         ]
 
+    def has_event(self, case_id: str, event_type: str) -> bool:
+        self.get_case(case_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM audit_events WHERE case_id = ? AND event_type = ? LIMIT 1",
+                (case_id, event_type),
+            ).fetchone()
+        return row is not None
+
+    def save_monitoring_run(self, run: MonitoringRun) -> MonitoringRun:
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO monitoring_runs (run_id, run_json, completed_at)
+                VALUES (?, ?, ?)
+                """,
+                (run.run_id, run.model_dump_json(), run.completed_at.isoformat()),
+            )
+        return run
+
+    def list_monitoring_runs(self, *, limit: int = 20) -> list[MonitoringRun]:
+        if limit < 1:
+            raise ValueError("Monitoring run limit must be at least 1.")
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT run_json
+                FROM monitoring_runs
+                ORDER BY completed_at DESC, run_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [MonitoringRun.model_validate_json(row["run_json"]) for row in rows]
+
     @staticmethod
     def _insert_event(
         connection: sqlite3.Connection,
@@ -272,12 +363,23 @@ class SQLiteCaseRepository:
 
     @staticmethod
     def _case_from_row(row: sqlite3.Row) -> InvestigationCase:
+        keys = set(row.keys())
         return InvestigationCase(
             case_id=row["case_id"],
             status=CaseStatus(row["status"]),
             listing=json.loads(row["listing_json"]),
             product=json.loads(row["product_json"]),
             assessment=json.loads(row["assessment_json"]),
+            evidence=(
+                json.loads(row["evidence_json"])
+                if "evidence_json" in keys and row["evidence_json"]
+                else None
+            ),
+            reappeared_from_case_id=(
+                row["reappeared_from_case_id"]
+                if "reappeared_from_case_id" in keys
+                else None
+            ),
             reviewer_name=row["reviewer_name"],
             reviewer_note=row["reviewer_note"],
             created_at=datetime.fromisoformat(row["created_at"]),

@@ -18,6 +18,7 @@ if str(SRC) not in sys.path:
 from brandshield.agent import generate_reviewer_narrative  # noqa: E402
 from brandshield.config import Settings  # noqa: E402
 from brandshield.models import CatalogProduct, CaseStatus, ListingInput  # noqa: E402
+from brandshield.monitoring import MonitoringService  # noqa: E402
 from brandshield.risk_engine import RiskEngine, render_case_file  # noqa: E402
 from brandshield.storage import SQLiteCaseRepository  # noqa: E402
 from brandshield.workflow import CaseWorkflow  # noqa: E402
@@ -95,6 +96,7 @@ def _build_workflow(database_path: str) -> CaseWorkflow:
 settings = Settings.from_env()
 workflow = _build_workflow(str(_resolved_path(settings.database_path)))
 repository = workflow.repository
+monitoring_service = MonitoringService(workflow)
 
 st.set_page_config(page_title="BrandShield", page_icon="🛡️", layout="wide")
 st.title("🛡️ BrandShield")
@@ -102,7 +104,9 @@ st.caption("Transparent counterfeit-risk triage with human-controlled enforcemen
 
 catalog_df, listings_df = _load_demo_data()
 
-analyze_tab, dashboard_tab = st.tabs(["Analyze listing", "Case dashboard"])
+analyze_tab, monitoring_tab, dashboard_tab = st.tabs(
+    ["Analyze listing", "Autonomous monitoring", "Case dashboard"]
+)
 
 with analyze_tab:
     selected_id = st.selectbox(
@@ -172,9 +176,17 @@ with analyze_tab:
                 else "Low-risk listings remain in monitoring and do not need a case."
             ),
         ):
+            existing_case = repository.find_case_by_listing_id(listing.listing_id)
             opened_case = workflow.open_case(listing, product)
             st.session_state["selected_case_id"] = opened_case.case_id
-            st.success(f"Created {opened_case.case_id}. Open the Case dashboard tab.")
+            if existing_case is None:
+                st.success(
+                    f"Created {opened_case.case_id}. Open the Case dashboard tab."
+                )
+            else:
+                st.info(
+                    f"Reused {opened_case.case_id}; the repeated observation was audited."
+                )
         st.download_button(
             "Download assessment",
             data=case_file,
@@ -202,6 +214,77 @@ with analyze_tab:
                     "Bedrock could not be called. Confirm AWS credentials, region, model "
                     f"access, and BEDROCK_MODEL_ID. Details: {exc}"
                 )
+
+with monitoring_tab:
+    st.subheader("Autonomous monitoring")
+    st.write(
+        "Scan the complete synthetic marketplace feed. BrandShield quietly ignores "
+        "low-risk listings, opens review-worthy cases, links reappearances, and isolates "
+        "malformed records instead of stopping the run."
+    )
+    st.info(
+        "This local demo performs no web scraping and sends no external request. "
+        "The same monitoring service is exposed to the Strands agent as a tool."
+    )
+    if st.button(
+        "Run monitoring cycle",
+        type="primary",
+        icon=":material/radar:",
+    ):
+        with st.spinner("Scanning the synthetic listing feed..."):
+            run = monitoring_service.scan_batch(
+                [
+                    _listing_from_row(row).model_dump(mode="json")
+                    for _, row in listings_df.iterrows()
+                ],
+                [
+                    _catalog_from_row(row).model_dump(mode="json")
+                    for _, row in catalog_df.iterrows()
+                ],
+            )
+        st.success(f"Monitoring run {run.run_id} completed without external actions.")
+
+    monitoring_runs = repository.list_monitoring_runs(limit=10)
+    if not monitoring_runs:
+        st.caption("No monitoring cycle has run yet.")
+    else:
+        latest_run = monitoring_runs[0]
+        st.markdown("#### Latest run")
+        with st.container(horizontal=True):
+            st.metric("Listings scanned", latest_run.total_listings, border=True)
+            st.metric("New cases", latest_run.cases_created_count, border=True)
+            st.metric("Reappearances", latest_run.reappearance_count, border=True)
+            st.metric("Duplicates", latest_run.duplicate_count, border=True)
+            st.metric("Errors isolated", latest_run.error_count, border=True)
+        st.dataframe(
+            pd.DataFrame(
+                [
+                    {
+                        "Listing": result.listing_id,
+                        "Outcome": result.outcome.value.upper().replace("_", " "),
+                        "Score": result.risk_score,
+                        "Case": result.case_id,
+                        "Related case": result.related_case_id,
+                        "Explanation": result.message,
+                    }
+                    for result in latest_run.results
+                ]
+            ),
+            hide_index=True,
+            width="stretch",
+            column_config={
+                "Score": st.column_config.ProgressColumn(
+                    "Score", min_value=0, max_value=100, format="%d"
+                ),
+                "Explanation": st.column_config.TextColumn(
+                    "Explanation", width="large"
+                ),
+            },
+        )
+        st.caption(
+            f"Completed {_display_time(latest_run.completed_at)}. Results are persisted "
+            "in the local audit database."
+        )
 
 with dashboard_tab:
     cases = repository.list_cases()
@@ -276,6 +359,21 @@ with dashboard_tab:
                 ),
             )
 
+        if selected_case.evidence is not None:
+            with st.container(border=True):
+                st.markdown("**Evidence provenance**")
+                verified = workflow.evidence_store.verify(selected_case.evidence)
+                st.write(
+                    f"SHA-256: `{selected_case.evidence.sha256}`  \n"
+                    f"Snapshot: `{selected_case.evidence.relative_path}`  \n"
+                    f"Integrity: **{'VERIFIED' if verified else 'FAILED'}**"
+                )
+                if selected_case.reappeared_from_case_id:
+                    st.warning(
+                        "Reappearance linked to prior case "
+                        f"{selected_case.reappeared_from_case_id}."
+                    )
+
         st.markdown("#### Human decision controls")
         reviewer = st.text_input(
             "Reviewer name",
@@ -333,6 +431,23 @@ with dashboard_tab:
                                 actor=reviewer or "human-reviewer",
                             )
                             st.session_state[f"report-{selected_case_id}"] = report
+                    if (
+                        selected_case.status is CaseStatus.APPROVED
+                        and repository.has_event(selected_case_id, "report_drafted")
+                    ):
+                        if st.button(
+                            "Simulate marketplace submission",
+                            icon=":material/science:",
+                            help="Records a demo event only; no network request is sent.",
+                        ):
+                            workflow.simulate_submission(
+                                selected_case_id,
+                                actor=reviewer,
+                                note=decision_note,
+                            )
+                            st.success(
+                                "Simulation recorded. No marketplace request was sent."
+                            )
                     if st.button("Close case", icon=":material/archive:"):
                         workflow.close_case(
                             selected_case_id,

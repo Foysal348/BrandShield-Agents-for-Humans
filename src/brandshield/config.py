@@ -21,6 +21,7 @@ class Settings:
 
     demo_mode: bool = True
     data_dir: Path = Path("data")
+    database_path: Path = Path("artifacts/brandshield.db")
     aws_region: str = "us-east-1"
     aws_profile: str | None = None
     bedrock_model_id: str = "us.amazon.nova-lite-v1:0"
@@ -32,6 +33,9 @@ class Settings:
         return cls(
             demo_mode=_as_bool(os.getenv("BRANDSHIELD_DEMO_MODE"), default=True),
             data_dir=Path(os.getenv("BRANDSHIELD_DATA_DIR", "data")),
+            database_path=Path(
+                os.getenv("BRANDSHIELD_DB_PATH", "artifacts/brandshield.db")
+            ),
             aws_region=os.getenv("AWS_REGION", "us-east-1"),
             aws_profile=profile,
             bedrock_model_id=os.getenv(

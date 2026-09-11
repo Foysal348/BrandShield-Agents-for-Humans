@@ -13,7 +13,11 @@ files, and keeps every legal or enforcement decision under human control.
 - Downloadable Markdown investigation case files
 - Streamlit demo using clearly synthetic data
 - Optional Strands + Amazon Bedrock reviewer narrative
-- Automated unit tests for scoring, validation, score caps, and case-file output
+- Persistent SQLite investigation cases with controlled lifecycle transitions
+- Named human approval/rejection with mandatory decision notes
+- Database-enforced append-only evidence audit trail
+- Human-gated marketplace review/takedown report drafts
+- Case-management dashboard and automated workflow tests
 
 ## Local setup (Windows PowerShell)
 
@@ -40,7 +44,7 @@ permissions. Calling Bedrock may consume AWS credits. Never commit `.env` or AWS
 ```text
 app/                    Streamlit demo
 data/                   Synthetic catalog and listing fixtures
-src/brandshield/        Domain models, risk engine, agent, and Strands tools
+src/brandshield/        Models, scoring, workflow, storage, reporting, agent, and tools
 tests/                  Deterministic unit tests
 docs/                   Architecture and submission documentation
 assets/                 Diagrams and demo assets
@@ -51,6 +55,10 @@ assets/                 Diagrams and demo assets
 The scoring engine explains every point it adds. The optional language model may summarize
 the resulting case, but it cannot submit a takedown or make the final determination. A human
 reviewer must verify evidence and approve any external action.
+
+The agent intentionally has no approve, reject, close, or send-takedown tool. Those actions
+remain behind named human controls in the dashboard. Report drafts are available only after a
+case moves through `new -> under_review -> approved`.
 
 ## License
 

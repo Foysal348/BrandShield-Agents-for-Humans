@@ -207,3 +207,36 @@ def test_list_cases_can_filter_by_status(
         case.case_id
     ]
     assert repository.list_cases(CaseStatus.APPROVED) == []
+
+
+def test_submission_simulation_requires_draft_and_records_no_external_send(
+    workflow: CaseWorkflow,
+    repository: SQLiteCaseRepository,
+    listing: ListingInput,
+    product: CatalogProduct,
+) -> None:
+    case = workflow.open_case(listing, product)
+    workflow.start_review(case.case_id, reviewer="Human Reviewer")
+    workflow.record_decision(
+        case.case_id,
+        approved=True,
+        reviewer="Human Reviewer",
+        note="Evidence warrants preparation of a platform review request.",
+    )
+
+    with pytest.raises(InvalidTransitionError):
+        workflow.simulate_submission(
+            case.case_id,
+            actor="Human Reviewer",
+            note="Dry run before platform review.",
+        )
+
+    workflow.create_report_draft(case.case_id, actor="brandshield-agent")
+    workflow.simulate_submission(
+        case.case_id,
+        actor="Human Reviewer",
+        note="Dry run before platform review.",
+    )
+    event = repository.list_events(case.case_id)[-1]
+    assert event.event_type == "submission_simulated"
+    assert event.details["external_request_sent"] is False

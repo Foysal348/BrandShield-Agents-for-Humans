@@ -45,3 +45,17 @@ def test_high_risk_case_can_complete_human_review_flow(monkeypatch, tmp_path) ->
 
     assert any("Draft only" in warning.value for warning in app.warning)
     assert not app.exception
+
+
+def test_autonomous_monitoring_cycle_surfaces_only_actionable_results(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("BRANDSHIELD_DB_PATH", str(tmp_path / "monitoring.db"))
+    app = AppTest.from_file(str(APP_PATH), default_timeout=20).run()
+
+    _button(app, "Run monitoring cycle").click().run()
+
+    assert any("completed without external actions" in item.value for item in app.success)
+    assert any(metric.label == "Listings scanned" and metric.value == "4" for metric in app.metric)
+    assert any(metric.label == "Reappearances" and metric.value == "1" for metric in app.metric)
+    assert not app.exception

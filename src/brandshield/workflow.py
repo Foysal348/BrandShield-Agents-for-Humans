@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from brandshield.evidence import EvidenceStore, listing_identity_fingerprint
 from brandshield.models import (
     CatalogProduct,
     CaseStatus,
@@ -21,6 +22,10 @@ class HumanDecisionRequiredError(PermissionError):
     """Raised when an automated identity attempts a human-only decision."""
 
 
+class LowRiskCaseError(ValueError):
+    """Raised when automation attempts to open a case below the review threshold."""
+
+
 ALLOWED_TRANSITIONS: dict[CaseStatus, set[CaseStatus]] = {
     CaseStatus.NEW: {CaseStatus.UNDER_REVIEW},
     CaseStatus.UNDER_REVIEW: {CaseStatus.APPROVED, CaseStatus.REJECTED},
@@ -37,9 +42,13 @@ class CaseWorkflow:
         self,
         repository: SQLiteCaseRepository,
         risk_engine: RiskEngine | None = None,
+        evidence_store: EvidenceStore | None = None,
+        review_threshold: int = 25,
     ) -> None:
         self.repository = repository
         self.risk_engine = risk_engine or RiskEngine()
+        self.evidence_store = evidence_store or EvidenceStore(repository.database_path.parent)
+        self.review_threshold = review_threshold
 
     def open_case(
         self,
@@ -49,13 +58,53 @@ class CaseWorkflow:
         actor: str = "brandshield-system",
     ) -> InvestigationCase:
         assessment = self.risk_engine.assess(listing, product)
+        if assessment.score < self.review_threshold:
+            raise LowRiskCaseError(
+                f"Risk score {assessment.score} is below the case threshold "
+                f"of {self.review_threshold}; continue monitoring."
+            )
+
+        existing = self.repository.find_case_by_listing_id(listing.listing_id)
+        if existing is not None:
+            self.repository.append_event(
+                existing.case_id,
+                event_type="duplicate_listing_observed",
+                actor=actor,
+                details={"listing_id": listing.listing_id},
+            )
+            return existing
+
+        evidence = self.evidence_store.capture(listing, product, assessment)
+        prior_case = self.repository.find_case_by_identity_fingerprint(
+            listing_identity_fingerprint(listing, product),
+            exclude_listing_id=listing.listing_id,
+        )
         case = InvestigationCase(
             case_id=self.repository.new_case_id(),
             listing=listing,
             product=product,
             assessment=assessment,
+            evidence=evidence,
+            reappeared_from_case_id=prior_case.case_id if prior_case else None,
         )
-        return self.repository.create_case(case, actor=actor)
+        created = self.repository.create_case(case, actor=actor)
+        if prior_case is not None:
+            self.repository.append_event(
+                prior_case.case_id,
+                event_type="listing_reappeared",
+                actor=actor,
+                details={
+                    "new_case_id": created.case_id,
+                    "new_listing_id": listing.listing_id,
+                },
+            )
+            self.repository.append_event(
+                created.case_id,
+                event_type="reappearance_linked",
+                actor=actor,
+                details={"prior_case_id": prior_case.case_id},
+            )
+        return created
 
     def start_review(
         self,
@@ -124,6 +173,38 @@ class CaseWorkflow:
             details={"report_type": "marketplace_review_request"},
         )
         return report
+
+    def simulate_submission(
+        self,
+        case_id: str,
+        *,
+        actor: str,
+        note: str,
+    ) -> None:
+        """Record a no-network submission simulation for an approved, drafted case."""
+        self._require_human_actor(actor)
+        case = self.repository.get_case(case_id)
+        if case.status is not CaseStatus.APPROVED:
+            raise InvalidTransitionError(
+                "Submission can be simulated only for a human-approved case."
+            )
+        if not self.repository.has_event(case_id, "report_drafted"):
+            raise InvalidTransitionError(
+                "Create and verify a report draft before simulating submission."
+            )
+        if not note.strip():
+            raise HumanDecisionRequiredError(
+                "A human simulation note is required."
+            )
+        self.repository.append_event(
+            case_id,
+            event_type="submission_simulated",
+            actor=actor,
+            details={
+                "note": note.strip(),
+                "external_request_sent": False,
+            },
+        )
 
     def _transition(
         self,
